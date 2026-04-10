@@ -47,9 +47,15 @@ This document contains the full set of architecture diagrams for the NoosphereOS
 │  └──────────────────────────────────────────────────────────────────┘   │
 │                                                                          │
 │  ┌──────────────────────────────────────────────────────────────────┐   │
-│  │  Event Bus                                                       │   │
-│  │  memory_promoted | memory_proposal_created | archive_snapshot    │   │
-│  │  memory_replicated | dkg_exported                                │   │
+│  │  Event Bus — NATS JetStream                                      │   │
+│  │  noosphere.memory.promoted.{agent_did}                           │   │
+│  │  noosphere.memory.proposal.created.{agent_did}                   │   │
+│  │  noosphere.l0.engram.synced.{agent_did}                          │   │
+│  │  noosphere.l1.mempalace.updated.{agent_did}                      │   │
+│  │  noosphere.l2.hindsight.retained.{agent_did}                     │   │
+│  │  noosphere.l3.archive.snapshot.created.{agent_did}               │   │
+│  │  noosphere.l4.dkg.export_requested.{agent_did}                   │   │
+│  │  noosphere.memory.reverted.{agent_did}                           │   │
 │  └──────────────────────────────────────────────────────────────────┘   │
 └──────────────────────────────────────────────────────────────────────────┘
     │                      │                      │                    │
@@ -144,13 +150,52 @@ This document contains the full set of architecture diagrams for the NoosphereOS
 │   └─────────────────────────────────────────────────────────────────┘   │
 │                                                                          │
 │   ┌─────────────────────────────────────────────────────────────────┐   │
-│   │  EVENT BUS                                                      │   │
-│   │  Topics:                                                        │   │
-│   │    memory_proposal_created  {agent, proposer, repo_did, pr_id}  │   │
-│   │    memory_promoted          {agent, commit, fact_id, curator}   │   │
-│   │    local_memory_updated     {agent, commit, anchors}            │   │
-│   │    archive_snapshot_created {agent, commit, arweave_tx_id}      │   │
-│   │    dkg_exported             {agent, knowledge_asset_id}         │   │
+│   │  EVENT BUS — NATS JetStream (ratified 2026-04-10)               │   │
+│   │                                                                 │   │
+│   │  Deployment topology:                                           │   │
+│   │    - Production: 3-node NATS cluster, JetStream replication=3   │   │
+│   │    - Dev/single-node: embedded NATS server (single binary)      │   │
+│   │    - Edge (ServerDomes/DePIN): NATS Leaf Nodes connecting to    │   │
+│   │      central cluster; agents publish locally, cluster replicates│   │
+│   │                                                                 │   │
+│   │  JetStream streams:                                             │   │
+│   │    NOOSPHERE_MEMORY     — subjects: noosphere.memory.>          │   │
+│   │    NOOSPHERE_L0         — subjects: noosphere.l0.>              │   │
+│   │    NOOSPHERE_L1         — subjects: noosphere.l1.>              │   │
+│   │    NOOSPHERE_L2         — subjects: noosphere.l2.>              │   │
+│   │    NOOSPHERE_L3         — subjects: noosphere.l3.>              │   │
+│   │    NOOSPHERE_L4         — subjects: noosphere.l4.>              │   │
+│   │                                                                 │   │
+│   │  Subject namespace (per-agent scoping):                         │   │
+│   │    noosphere.memory.proposal.created.{agent_did}                │   │
+│   │    noosphere.memory.promoted.{agent_did}                        │   │
+│   │    noosphere.memory.reverted.{agent_did}                        │   │
+│   │    noosphere.l0.engram.synced.{agent_did}                       │   │
+│   │    noosphere.l1.mempalace.updated.{agent_did}                   │   │
+│   │    noosphere.l2.hindsight.retained.{agent_did}                  │   │
+│   │    noosphere.l3.archive.snapshot.created.{agent_did}            │   │
+│   │    noosphere.l4.dkg.export_requested.{agent_did}                │   │
+│   │                                                                 │   │
+│   │  Consumer model:                                                │   │
+│   │    - All workers use durable pull consumers (work-queue)        │   │
+│   │    - Delivery: at-least-once; idempotency keys per message      │   │
+│   │    - Dead-letter: NOOSPHERE_DLQ stream for failed deliveries    │   │
+│   │                                                                 │   │
+│   │  Message envelope — CloudEvents (application/cloudevents+json): │   │
+│   │    { specversion, type, source, id, time,                       │   │
+│   │      datacontenttype, data: { ...payload } }                    │   │
+│   │                                                                 │   │
+│   │  Built-in KV buckets (JetStream KV):                           │   │
+│   │    KV_AGENT_REGISTRY   — agent DID → metadata, status          │   │
+│   │    KV_UCAN_REVOCATIONS — revoked UCAN CIDs                      │   │
+│   │    KV_SESSION_STATE    — transient per-agent session state      │   │
+│   │                                                                 │   │
+│   │  Security:                                                      │   │
+│   │    - TLS on all connections                                     │   │
+│   │    - NKEYS + JWT-based auth (maps to agent DID namespaces)      │   │
+│   │    - Per-subject publish/subscribe ACLs enforced by server      │   │
+│   │    - Agents may only publish to noosphere.*.*.{own_agent_did}   │   │
+│   │    - Cross-agent subscriptions require operator-issued JWT      │   │
 │   └─────────────────────────────────────────────────────────────────┘   │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
@@ -210,9 +255,11 @@ This document contains the full set of architecture diagrams for the NoosphereOS
 │  │    - Core identity: ...                                           │  │
 │  │    - Risk constraints: ...                                        │  │
 │  │                                                                   │  │
-│  │  GitLawb Repo Events (subscribed by Noosphere Event Bus):         │  │
+│  │  GitLawb Repo Events (bridged to NATS by Noosphere Event Bus):    │  │
 │  │    - pr_opened, pr_reviewed, pr_merged, commit_created            │  │
 │  │    - Each event includes: author DID, UCAN CID, commit SHA        │  │
+│  │    - Published to: noosphere.memory.proposal.created.{agent_did}  │  │
+│  │                    noosphere.memory.promoted.{agent_did}          │  │
 │  └───────────────────────────────────────────────────────────────────┘  │
 │                                                                          │
 │  KEY PRINCIPLE: Engram is the primary store. MEMORY.md is a curated,   │
@@ -294,9 +341,14 @@ This document contains the full set of architecture diagrams for the NoosphereOS
 │                                                                          │
 │   Triggers for reload/update:                                           │
 │   ├── Startup: loads MEMORY.md from GitLawb main branch                 │
-│   ├── On memory_promoted event: re-parses sacred facts, updates rooms   │
-│   ├── On Engram sync: incorporates latest observation records           │
+│   ├── On memory_promoted event: NATS pull consumer on                   │
+│   │     noosphere.memory.promoted.{agent_did}                          │
+│   │     Re-parses sacred facts, updates palace rooms                   │
+│   ├── On Engram sync: NATS pull consumer on                             │
+│   │     noosphere.l0.engram.synced.{agent_did}                         │
+│   │     Incorporates latest observation records                         │
 │   └── On task completion: writes new episodic entries locally           │
+│       Publishes: noosphere.l1.mempalace.updated.{agent_did}             │
 │                                                                          │
 │   Recall interface:                                                      │
 │   ├── MCP tools: memory_search, memory_reflect                          │
@@ -314,7 +366,9 @@ This document contains the full set of architecture diagrams for the NoosphereOS
 │                                                                          │
 │   ┌───────────────────────────────────────────────────────────────┐     │
 │   │  INGEST (retain)                                              │     │
-│   │  - Subscribes to memory_promoted, task_completed, episodic    │     │
+│   │  - NATS durable pull consumer on:                             │     │
+│   │      noosphere.memory.promoted.{agent_did}                    │     │
+│   │      noosphere.l0.engram.synced.{agent_did}                   │     │
 │   │  - Accepts structured memories from Engram sync workers       │     │
 │   │  - Extracts: facts, entities, relationships, temporal links   │     │
 │   │  - Builds structured observations:                            │     │
@@ -343,6 +397,8 @@ This document contains the full set of architecture diagrams for the NoosphereOS
 │   │  Scoped by: agent_id / user_id / tenant                       │     │
 │   │  Returns: top-k memories + provenance + source commit CID     │     │
 │   │  Interfaces: HTTP API | Python client | MCP wrapper           │     │
+│   │  On retain complete: publishes to NATS                        │     │
+│   │    noosphere.l2.hindsight.retained.{agent_did}                │     │
 │   └───────────────────────────────────────────────────────────────┘     │
 │                                                                          │
 │   Memory types handled:                                                  │
@@ -398,7 +454,9 @@ This document contains the full set of architecture diagrams for the NoosphereOS
 │  │  Queryable by agents and operators for reference lookups        │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                                                                          │
-│  Trigger: archive worker subscribes to memory_promoted events           │
+│  Trigger: archive worker maintains durable NATS pull consumer on        │
+│    noosphere.memory.promoted.> (all agents, sacred_fact policy=true)    │
+│  On completion: publishes noosphere.l3.archive.snapshot.created.{did}   │
 │  Policy: sacred_fact=true OR type=constitution → always snapshot        │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
@@ -432,7 +490,8 @@ This document contains the full set of architecture diagrams for the NoosphereOS
 │   - Audits and compliance proofs                                         │
 │   - Noosphere "commons": shared world-model for a multi-org swarm       │
 │                                                                          │
-│  Trigger: exporter subscribes to dkg_export_requested events            │
+│  Trigger: DKG exporter maintains durable NATS pull consumer on          │
+│    noosphere.l4.dkg.export_requested.> (explicit operator/agent action) │
 │  Policy:  explicit opt-in only — NO automatic full-memory DKG export    │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
@@ -468,13 +527,14 @@ This document contains the full set of architecture diagrams for the NoosphereOS
        │     PR metadata: {proposer: β-did, ucan_cid, fact_id}
        │
        ▼
-  [Noosphere Event Bus]
-       │  4. Emits: memory_proposal_created
-       │     {agent: α, proposer: β, repo_did, pr_id}
+  [NATS JetStream — stream: NOOSPHERE_MEMORY]
+       │  4. Publishes: noosphere.memory.proposal.created.{α-did}
+       │     CloudEvents envelope: {type, source, id, time,
+       │       data: {agent: α, proposer: β, repo_did, pr_id}}
        │
        ▼
   [Curator Agent γ / Human Operator]
-       │  5. Receives notification
+       │  5. Pull consumer receives message from NOOSPHERE_MEMORY stream
        │     Calls memory_diff(pr_id) → inspects change in context
        │       of existing sacred facts and Engram state
        │
@@ -489,31 +549,37 @@ This document contains the full set of architecture diagrams for the NoosphereOS
   [GitLawb Repo: did:gitlawb:α-memory]
        │  7. Merges PR to main (protected branch)
        │     Creates commit C_main { updated MEMORY.md }
-       │     Emits repo events: pr_merged, commit_created(C_main)
+       │     GitLawb webhook bridge triggers NATS publish
        │
        ▼
-  [Noosphere Event Bus]
-       │  8. Emits: memory_promoted
-       │     {agent: α, commit: C_main, fact_id, proposer: β, curator: γ}
+  [NATS JetStream — stream: NOOSPHERE_MEMORY]
+       │  8. Publishes: noosphere.memory.promoted.{α-did}
+       │     CloudEvents envelope: {type, source, id, time,
+       │       data: {agent: α, commit: C_main, fact_id,
+       │              proposer: β, curator: γ}}
        │
        ├──────────────────────────────────────────────────┐
        │                                                  │
-       ▼  (parallel, async)                               ▼  (parallel, async)
+       ▼  (parallel, async pull consumers)                ▼  (parallel, async)
 
   [Engram Sync Worker — Agent α]               [MemPalace — Agent α]
-       │  9a. Listens for memory_promoted            │  9b. Listens for memory_promoted
-       │      Fetches MEMORY.md at C_main            │      Fetches MEMORY.md at C_main
-       │      Writes structured sacred_fact          │      Parses sacred facts section
-       │      record into α's Engram store:          │      Updates palace:
-       │        {content, entities, provenance:      │        - "Sacred Facts" room
-       │         β-did, γ-did, commit, ts}           │        - New triples inserted
-       │      Resolves contradictions if any         │        - High-priority recall flag
-       │      Emits: engram_synced {fact_id}         │      Emits: local_memory_updated
+       │  9a. Pull consumer on                      │  9b. Pull consumer on
+       │      noosphere.memory.promoted.{α-did}     │      noosphere.memory.promoted.{α-did}
+       │      Fetches MEMORY.md at C_main           │      Fetches MEMORY.md at C_main
+       │      Writes structured sacred_fact         │      Parses sacred facts section
+       │      record into α's Engram store:         │      Updates palace:
+       │        {content, entities, provenance:     │        - "Sacred Facts" room
+       │         β-did, γ-did, commit, ts}          │        - New triples inserted
+       │      Resolves contradictions if any        │        - High-priority recall flag
+       │      Publishes:                            │      Publishes:
+       │        noosphere.l0.engram.synced.{α-did}  │        noosphere.l1.mempalace.updated.{α-did}
        │
-       ▼  (parallel, async)
+       ▼  (parallel, async pull consumer)
 
   [Hindsight Ingest Worker — L2]
-       │  9c. Listens for memory_promoted + engram_synced
+       │  9c. Pull consumers on:
+       │        noosphere.memory.promoted.{α-did}
+       │        noosphere.l0.engram.synced.{α-did}
        │      Reads MEMORY.md diff at C_main + Engram record
        │      Builds structured sacred_fact memory:
        │        {subject: α,
@@ -530,25 +596,28 @@ This document contains the full set of architecture diagrams for the NoosphereOS
        │        - BM25 keyword index
        │        - Entity/relationship graph
        │        - Temporal index
-       │      Fact now participates in retain/recall/reflect pipeline
-       │      Emits: hindsight_retained {memory_id}
+       │      Publishes:
+       │        noosphere.l2.hindsight.retained.{α-did}
        │
        ▼  (if sacred_fact policy = archive)
 
   [Archive Worker]
-       │  10. Fetches MEMORY.md at C_main
+       │  10. Pull consumer on noosphere.memory.promoted.{α-did}
+       │      Fetches MEMORY.md at C_main
        │      Writes to Arweave/ArDrive:
        │        tags: {agent: α, commit: C_main, type: sacred_fact_snapshot,
        │               engram_snapshot_id, hindsight_memory_ids}
        │      Writes index row to WeaveDB:
        │        {arweave_tx_id, agent: α, commit: C_main,
        │         fact_ids, engram_snapshot_id, hindsight_memory_ids, ...}
-       │      Emits: archive_snapshot_created {arweave_tx_id}
+       │      Publishes:
+       │        noosphere.l3.archive.snapshot.created.{α-did}
        │
        ▼  (only if dkg_export_requested)
 
   [DKG Exporter]
-        11. Publishes Knowledge Asset on OriginTrail DKG
+        11. Pull consumer on noosphere.l4.dkg.export_requested.{α-did}
+            Publishes Knowledge Asset on OriginTrail DKG
             Links: arweave_tx_id + hindsight_memory_id + engram_snapshot_id
             Access: org-permissioned or public (per policy)
 ```
@@ -587,9 +656,13 @@ This document contains the full set of architecture diagrams for the NoosphereOS
   │   episodic/semantic recall; incorporates MEMORY.md anchors and
   │   Engram sync records.
   │
-  └── Hindsight: reachable via HTTP or Python client (MCP wrapper optional);
-      cluster-level L2 substrate for sovereign retain/recall/reflect
-      across agents and sessions.
+  ├── Hindsight: reachable via HTTP or Python client (MCP wrapper optional);
+  │   cluster-level L2 substrate for sovereign retain/recall/reflect
+  │   across agents and sessions.
+  │
+  └── NATS JetStream: event bus for all async lifecycle events across the
+      memory pipeline; workers use durable pull consumers per stream;
+      GitLawb webhook bridge publishes into NATS subject namespace.
 
   AUTHORIZATION CHAIN PER TOOL CALL:
 
@@ -611,13 +684,14 @@ This document contains the full set of architecture diagrams for the NoosphereOS
               │      - Does principal have a valid UCAN delegation
               │        for the exact resource/ability/branch?
               │      - Is the delegation unexpired and unrevoked?
+              │        (revocation checked against NATS KV_UCAN_REVOCATIONS)
               │      - Is the chain of trust intact?
               │
               ├─ 4. If all pass → forward to GitLawb MCP operation
               │      with the agent's capability token
               │
               └─ 5. Log: principal, tool, resource, decision,
-                       UCAN CID, timestamp → Audit log / Event bus
+                       UCAN CID, timestamp → Audit log + NATS event
 ```
 
 ---
@@ -662,8 +736,10 @@ This document contains the full set of architecture diagrams for the NoosphereOS
   ROLLBACK POLICY:
   ─────────────────────────────────────────────────────────────────────
   1. Revert bad commit on MEMORY.md main branch (git revert C_bad)
-  2. Emit memory_reverted { agent, reverted_commit, reason }
-  3. Engram sync worker marks affected records as "superseded"
+  2. Publish to NATS: noosphere.memory.reverted.{agent_did}
+       {agent, reverted_commit, reason, operator_did}
+  3. Engram sync worker (pull consumer on memory.reverted) marks
+       affected records as "superseded"
   4. MemPalace re-fetches MEMORY.md → removes reverted facts from palace
   5. Hindsight marks affected memories as "superseded" via update API
   6. WeaveDB row retains record for audit; Arweave snapshot is permanent
@@ -675,6 +751,6 @@ This document contains the full set of architecture diagrams for the NoosphereOS
 
 *Generated for the [NoosphereOS](https://github.com/enuno/NoosphereOS) project.*
 
-*Architecture ratified April 2026. Sovereign stack: **Engram + GitLawb MEMORY.md (L0)**, **MemPalace (L1)**, **Hindsight (L2)**, **WeaveDB + Arweave/ArDrive (L3)**, **OriginTrail DKG (L4)**.*
+*Architecture ratified April 2026. Sovereign stack: **Engram + GitLawb MEMORY.md (L0)**, **MemPalace (L1)**, **Hindsight (L2)**, **WeaveDB + Arweave/ArDrive (L3)**, **OriginTrail DKG (L4)**. Event bus: **NATS JetStream**.*
 
-*NoosphereOS is a fully sovereign multi-agent memory operating system combining web2 operational control (Engram, GitLawb, MemPalace, Hindsight) with web3 permanence and verifiable knowledge sharing (Arweave/ArDrive, WeaveDB, OriginTrail DKG).*
+*NoosphereOS is a fully sovereign multi-agent memory operating system combining web2 operational control (Engram, GitLawb, MemPalace, Hindsight, NATS JetStream) with web3 permanence and verifiable knowledge sharing (Arweave/ArDrive, WeaveDB, OriginTrail DKG).*

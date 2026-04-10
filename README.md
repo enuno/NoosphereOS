@@ -101,7 +101,7 @@ NoosphereOS defines five memory layers, each with a distinct scope, durability m
 | `NOOSPHERE_L2` | `noosphere.l2.>` | Hindsight retain events |
 | `NOOSPHERE_L3` | `noosphere.l3.>` | Archive snapshot events |
 | `NOOSPHERE_L4` | `noosphere.l4.>` | DKG export request/complete events |
-| `NOOSPHERE_DLQ` | `noosphere.dlq.>` | Dead-letter stream for failed deliveries |
+| `NOOSPHERE_DLQ` | `noosphere.dlq.>` | Dead-letter stream for failed deliveries — see DLQ Strategy below |
 
 ### Subject Namespace
 
@@ -114,6 +114,12 @@ noosphere.l1.mempalace.updated.{agent_did}
 noosphere.l2.hindsight.retained.{agent_did}
 noosphere.l3.archive.snapshot.created.{agent_did}
 noosphere.l4.dkg.export_requested.{agent_did}
+
+# DLQ subjects (written by NATS server on MaxDeliver exhaustion):
+noosphere.dlq.{origin_stream}.{origin_subject_sanitized}
+# e.g.:
+noosphere.dlq.NOOSPHERE_MEMORY.noosphere.memory.promoted.did-gitlawb-agent-alpha
+noosphere.dlq.NOOSPHERE_L3.noosphere.memory.promoted.did-gitlawb-agent-alpha
 ```
 
 All `{agent_did}` tokens are URL-safe encoded DID strings. Workers use the `>` wildcard to subscribe across all agents within their scope (`noosphere.memory.promoted.>`).
@@ -125,6 +131,7 @@ All `{agent_did}` tokens are URL-safe encoded DID strings. Workers use the `>` w
 | `KV_AGENT_REGISTRY` | Agent DID → metadata, status, public key |
 | `KV_UCAN_REVOCATIONS` | Revoked UCAN CIDs (checked on every tool call) |
 | `KV_SESSION_STATE` | Transient per-agent session state |
+| `KV_DLQ_MANIFEST` | DLQ entry index: `{dlq_msg_id → origin_subject, worker, attempt_count, error_class, ts_first_fail, ts_dlq, agent_did, fact_id, memory_class}` — used by the operator runbook tooling and alerting |
 
 ### Message Envelope (CloudEvents)
 
@@ -146,14 +153,171 @@ All `{agent_did}` tokens are URL-safe encoded DID strings. Workers use the `>` w
 }
 ```
 
-### Consumer Model
+### Consumer Model and Delivery Guarantees
 
 All workers use **durable pull consumers** (work-queue semantics):
 
-- Delivery policy: at-least-once; workers must be idempotent.
-- Idempotency keys are included in each CloudEvents `id` field.
-- Failed messages after max delivery attempts are routed to `NOOSPHERE_DLQ`.
-- Workers ack each message explicitly after successful processing.
+- **Delivery policy:** at-least-once; all workers MUST be idempotent on the `id` field of the CloudEvents envelope.
+- **Idempotency keys:** the CloudEvents `id` (UUID) is the idempotency key. Workers record processed IDs in their local store (or a shared KV bucket) and skip re-delivery of already-processed messages.
+- **Explicit ack required:** workers call `msg.ack()` only after the downstream operation (Engram write, Hindsight retain call, Arweave upload, etc.) completes and is confirmed. Partial failures must not be acked.
+- **Ack wait:** default `AckWait = 30s` for standard workers; `AckWait = 300s` for archive and DKG workers which perform external network calls. Configurable per consumer in the stream JSON definition.
+- **Max delivery:** `MaxDeliver = 5` across all streams. After 5 failed delivery attempts the NATS server routes the message to `NOOSPHERE_DLQ`.
+
+---
+
+### DLQ Strategy — Sacred Facts Must Never Vanish
+
+The `NOOSPHERE_DLQ` stream is a **first-class operational concern**, not a discard bin. Any message that reaches the DLQ carries a sacred fact, memory promotion, or archive event that must be recovered or deliberately triaged. The following policy is mandatory for all NoosphereOS deployments.
+
+#### NOOSPHERE_DLQ Stream Spec
+
+```json
+{
+  "name": "NOOSPHERE_DLQ",
+  "subjects": ["noosphere.dlq.>"],
+  "retention": "limits",
+  "max_age": "168h",
+  "max_msgs": 50000,
+  "max_msg_size": 1048576,
+  "storage": "file",
+  "num_replicas": 3,
+  "discard": "old",
+  "deny_delete": true,
+  "deny_purge": true
+}
+```
+
+- `max_age` is **7 days** — sufficient for any on-call rotation to triage without data loss.
+- `deny_delete` and `deny_purge` are **locked**; only an operator with break-glass authority may remove DLQ messages, and every such action is logged.
+- Replication=3 matches production streams; DLQ data is as durable as source event data.
+
+#### Retry Schedule (before DLQ routing)
+
+Each worker consumer is configured with exponential back-off on the NATS server side using `BackOff` intervals:
+
+```
+Attempt 1 (immediate):   0s   delay
+Attempt 2:               15s  delay
+Attempt 3:               60s  delay
+Attempt 4:               300s delay  (5 min)
+Attempt 5:               900s delay  (15 min)
+→ MaxDeliver exhausted: route to noosphere.dlq.{stream}.{subject}
+```
+
+Workers that encounter a deterministic error (e.g., schema validation failure, revoked UCAN) may call `msg.term()` instead of `msg.nak()` to skip the retry schedule and route directly to DLQ. This prevents wasting retry budget on poison messages.
+
+#### DLQ Message Classification
+
+Every message that lands in `NOOSPHERE_DLQ` is classified by the DLQ consumer on arrival and written to `KV_DLQ_MANIFEST`:
+
+| Error class | Definition | Default action |
+|---|---|---|
+| `transient` | Network timeout, downstream service unavailable, rate limit | Auto-retry after operator clears the downstream issue |
+| `schema_error` | Malformed CloudEvents envelope, missing required field | Page operator; manual fix required before re-injection |
+| `auth_error` | UCAN revoked or expired at time of processing | Re-issue UCAN or escalate; re-inject with fresh token |
+| `idempotency_skip` | Message was already successfully processed (duplicate delivery) | Auto-ack and discard; write to KV_DLQ_MANIFEST for audit |
+| `poison` | Worker crashed repeatedly; payload cannot be processed | Quarantine; human triage required; never auto-re-inject |
+| `external_failure` | Arweave upload failed, OriginTrail DKG node unavailable, Hindsight DB down | Alert + queue for re-injection once external service recovers |
+
+The DLQ consumer writes the classification to `KV_DLQ_MANIFEST` with the key `dlq:{dlq_msg_id}` and the full structured record:
+
+```json
+{
+  "dlq_msg_id": "<nats_sequence_id>",
+  "origin_stream": "NOOSPHERE_L3",
+  "origin_subject": "noosphere.memory.promoted.did-gitlawb-agent-alpha",
+  "worker": "archive-worker",
+  "attempt_count": 5,
+  "error_class": "external_failure",
+  "error_detail": "ArDrive upload: 503 gateway timeout",
+  "memory_class": "sacred_fact",
+  "agent_did": "did:gitlawb:agent:alpha",
+  "fact_id": "fact-001",
+  "commit": "C_main_abc123",
+  "ts_first_fail": "2026-04-10T21:00:00Z",
+  "ts_dlq": "2026-04-10T21:17:00Z"
+}
+```
+
+#### Sacred Fact and Constitution Escalation
+
+Messages where `memory_class` is `sacred_fact` or `constitution` receive **immediate PagerDuty/alertmanager escalation** regardless of error class. No sacred fact may age out of the DLQ without a documented triage decision.
+
+```yaml
+# monitoring/prometheus/noosphere-rules.yml (excerpt)
+- alert: DLQSacredFactUnresolved
+  expr: noosphere_dlq_manifest_unresolved{memory_class=~"sacred_fact|constitution"} > 0
+  for: 5m
+  labels:
+    severity: critical
+  annotations:
+    summary: "DLQ contains unresolved sacred fact or constitution event"
+    description: "agent_did={{ $labels.agent_did }} fact_id={{ $labels.fact_id }} error_class={{ $labels.error_class }}"
+
+- alert: DLQDepthWarning
+  expr: nats_consumer_num_pending{stream_name="NOOSPHERE_DLQ"} > 100
+  for: 15m
+  labels:
+    severity: warning
+  annotations:
+    summary: "NOOSPHERE_DLQ depth exceeds 100 unprocessed messages"
+
+- alert: DLQMessageApproachingExpiry
+  expr: noosphere_dlq_manifest_age_hours > 120
+  for: 1m
+  labels:
+    severity: critical
+  annotations:
+    summary: "DLQ message approaching 7-day expiry — triage immediately"
+```
+
+#### DLQ Re-injection Flow
+
+After the root cause is resolved, re-injection follows a strict path — **never direct stream publish**:
+
+```text
+1. Operator identifies message in KV_DLQ_MANIFEST
+   → nats kv get KV_DLQ_MANIFEST dlq:{dlq_msg_id}
+
+2. Operator or re-injection tool fetches raw message from NOOSPHERE_DLQ
+   → nats consumer next NOOSPHERE_DLQ dlq-operator-consumer
+
+3. For auth_error: re-issue UCAN, embed in message headers, then re-inject.
+   For schema_error: patch payload, re-wrap in CloudEvents envelope with new `id`.
+   For transient/external_failure: re-inject original message unchanged.
+
+4. Re-inject via the dedicated re-injection subject:
+   → publish to: noosphere.dlq.reinject.{origin_stream}.{agent_did}
+   → The DLQ re-injection worker consumes this subject, validates the message,
+     and publishes to the correct origin stream subject with a fresh sequence.
+
+5. Ack and remove from NOOSPHERE_DLQ only after successful re-injection confirmation.
+
+6. Update KV_DLQ_MANIFEST entry: set resolved=true, ts_resolved, operator_did.
+```
+
+The re-injection worker (`workers/dlq-reinjector/`) is the **only** component permitted to write back into source streams from a DLQ message. All re-injection is logged, attributed to the operator DID, and emits a `noosphere.dlq.reinjected.{agent_did}` audit event.
+
+#### DLQ Worker (dlq-reinjector)
+
+Add `workers/dlq-reinjector/` to the project scaffolding:
+
+- Maintains a durable pull consumer on `noosphere.dlq.reinject.>`.
+- Validates the incoming re-injection envelope (CloudEvents schema check, UCAN validity if present).
+- Publishes to the designated origin subject with idempotency key preserved.
+- Updates `KV_DLQ_MANIFEST` with resolution metadata.
+- Emits `noosphere.dlq.reinjected.{agent_did}` to `NOOSPHERE_MEMORY` stream for audit trail.
+
+#### Operator Runbook Summary
+
+| Condition | Action |
+|---|---|
+| DLQ depth > 0 for `sacred_fact` / `constitution` | Page on-call immediately; check `KV_DLQ_MANIFEST`; do not wait |
+| DLQ depth > 100 (any class) | Alert; review `KV_DLQ_MANIFEST` for `transient` / `external_failure` bulk re-injection |
+| Message age > 5 days | Critical alert; escalate before 7-day expiry window closes |
+| `poison` class message | Quarantine (do not re-inject); engage memory architecture review |
+| External service recovered (Arweave, OriginTrail, Hindsight) | Run bulk re-injection for `external_failure` class; confirm `KV_DLQ_MANIFEST` all resolved |
+| Break-glass DLQ purge required | Requires 2-operator approval; log to audit stream before purge; never purge without resolved entry in KV_DLQ_MANIFEST |
 
 ***
 
@@ -182,6 +346,7 @@ The Noosphere control plane coordinates all memory operations and consists of fi
   - L3 (WeaveDB + Arweave/ArDrive) is **immutable org-level history**.
   - L4 (OriginTrail DKG) is **globally verifiable knowledge**, explicitly exported.
 - **Rollback and auditability:** any sacred fact traces to an Engram record, a git commit, proposer/curator DIDs, a Hindsight observation, and a permaweb snapshot. Bad merges are reverted via `noosphere.memory.reverted.{agent_did}` events which propagate automatically to Engram, MemPalace, and Hindsight.
+- **DLQ as sacred ground:** no message in `NOOSPHERE_DLQ` may expire without a documented triage decision. Sacred facts and constitutions in the DLQ trigger immediate escalation.
 
 ***
 
@@ -215,6 +380,8 @@ Example operation: **Agent β proposes a new sacred fact for Agent α**.
 5. **DKG export (L4, explicit opt-in)**
    - DKG exporter (stream `NOOSPHERE_L4`, subject `dkg.export_requested`): publishes Knowledge Asset on OriginTrail DKG linking Arweave + Hindsight + Engram IDs with access policy (public / org-permissioned / group).
 
+> **Failure at any step:** if a worker exhausts its retry schedule, the message is routed to `NOOSPHERE_DLQ`. For sacred fact promotions, this triggers an immediate `DLQSacredFactUnresolved` alert. The fact remains in the source layer(s) that successfully processed it; no data is lost, but the pipeline is incomplete until the DLQ is resolved. See [DLQ Strategy](#dlq-strategy--sacred-facts-must-never-vanish).
+
 ***
 
 ## Roles and Permissions
@@ -240,7 +407,7 @@ All MCP access is authenticated via OAuth 2.1; every tool call is validated agai
 - **Engram** runs per agent as the internal hot-memory engine (SQLite/FTS5); accessed by local runtimes or via its own MCP server.
 - **MemPalace** sits as a local sidecar with MCP server; provides high-quality local episodic/semantic recall incorporating `MEMORY.md` anchors and Engram sync records.
 - **Hindsight** reachable via HTTP or Python client (MCP wrapper optional); cluster-level L2 substrate for structured retain/recall/reflect.
-- **NATS JetStream** is the event bus: all workers subscribe to durable pull consumers; the GitLawb webhook bridge publishes into the `noosphere.*` subject namespace; KV buckets provide agent registry, UCAN revocation ledger, and session state.
+- **NATS JetStream** is the event bus: all workers subscribe to durable pull consumers; the GitLawb webhook bridge publishes into the `noosphere.*` subject namespace; KV buckets provide agent registry, UCAN revocation ledger, session state, and the DLQ manifest index.
 - **Arweave/ArDrive + WeaveDB** provide permaweb permanence and queryable indexes for L3 archival snapshots.
 - **OriginTrail DKG** provides verifiable cross-org knowledge sharing at L4 via explicit export.
 
@@ -263,6 +430,7 @@ NoosphereOS/
 │   ├── ucan-model.md                  # UCAN capability model and attenuation rules
 │   ├── rbac-policy.md                 # Role definitions and policy matrix
 │   ├── nats-event-bus.md              # NATS JetStream setup, streams, subjects
+│   ├── dlq-strategy.md                # DLQ classification, retry schedule, runbook
 │   ├── hindsight-integration.md       # Hindsight retain/recall/reflect guide
 │   └── deployment-guide.md            # Docker Compose and Kubernetes deployment
 │
@@ -305,11 +473,12 @@ NoosphereOS/
 │   │   ├── NOOSPHERE_L2.json
 │   │   ├── NOOSPHERE_L3.json
 │   │   ├── NOOSPHERE_L4.json
-│   │   └── NOOSPHERE_DLQ.json
+│   │   └── NOOSPHERE_DLQ.json         # deny_delete=true, deny_purge=true, max_age=168h
 │   ├── kv-buckets/                    # KV bucket provisioning scripts
 │   │   ├── KV_AGENT_REGISTRY.sh
 │   │   ├── KV_UCAN_REVOCATIONS.sh
-│   │   └── KV_SESSION_STATE.sh
+│   │   ├── KV_SESSION_STATE.sh
+│   │   └── KV_DLQ_MANIFEST.sh         # DLQ entry index for operator tooling and alerts
 │   ├── accounts/                      # NKEYS + JWT account configs (per agent DID)
 │   └── docker-compose.nats.yml        # Standalone NATS cluster compose file
 │
@@ -330,8 +499,15 @@ NoosphereOS/
 │   │   ├── src/
 │   │   ├── Dockerfile
 │   │   └── README.md
-│   └── dkg-exporter/                  # L4: dkg_export_requested → OriginTrail DKG
+│   ├── dkg-exporter/                  # L4: dkg_export_requested → OriginTrail DKG
+│   │   ├── src/
+│   │   ├── Dockerfile
+│   │   └── README.md
+│   └── dlq-reinjector/                # DLQ: operator-triggered re-injection back to origin streams
 │       ├── src/
+│       │   ├── main.py                # Pull consumer on noosphere.dlq.reinject.>
+│       │   ├── classifier.py          # Error class detection; writes KV_DLQ_MANIFEST
+│       │   └── reinjector.py          # Validates, re-publishes to origin stream, updates manifest
 │       ├── Dockerfile
 │       └── README.md
 │
@@ -374,6 +550,7 @@ NoosphereOS/
 │   │   ├── noosphere/
 │   │   │   ├── client.py              # MCP tool wrappers
 │   │   │   ├── events.py              # NATS publish/subscribe helpers
+│   │   │   ├── dlq.py                 # KV_DLQ_MANIFEST read/write helpers; re-injection client
 │   │   │   ├── ucan.py                # UCAN minting and validation
 │   │   │   └── models.py              # Pydantic models for events and memory types
 │   │   └── pyproject.toml
@@ -381,6 +558,7 @@ NoosphereOS/
 │       ├── src/
 │       │   ├── client.ts
 │       │   ├── events.ts
+│       │   ├── dlq.ts                 # KV_DLQ_MANIFEST helpers; re-injection client
 │       │   └── ucan.ts
 │       └── package.json
 │
@@ -400,11 +578,14 @@ NoosphereOS/
 │
 ├── monitoring/                        # Observability
 │   ├── prometheus/
-│   │   └── noosphere-rules.yml        # Alert rules for memory pipeline SLOs
+│   │   └── noosphere-rules.yml        # Alert rules: DLQSacredFactUnresolved (critical),
+│   │                                  #   DLQDepthWarning, DLQMessageApproachingExpiry,
+│   │                                  #   memory pipeline SLOs
 │   ├── grafana/
 │   │   └── dashboards/
-│   │       ├── nats-jetstream.json    # NATS stream lag, consumer health
+│   │       ├── nats-jetstream.json    # NATS stream lag, consumer health, DLQ depth
 │   │       ├── memory-pipeline.json   # Promotion latency, L0→L4 event rates
+│   │       ├── dlq-manifest.json      # DLQ depth by error class, age, memory class
 │   │       └── hindsight-l2.json      # Retain/recall/reflect metrics
 │   └── loki/
 │       └── noosphere-log-pipeline.yml
@@ -413,29 +594,36 @@ NoosphereOS/
     ├── integration/                   # End-to-end memory promotion flow tests
     │   ├── test_sacred_fact_promotion.py
     │   ├── test_rollback_flow.py
-    │   └── test_nats_consumers.py
+    │   ├── test_nats_consumers.py
+    │   └── test_dlq_reinjection.py    # DLQ routing, classification, and re-injection flow
     ├── unit/
     │   ├── test_ucan_broker.py
     │   ├── test_rbac_engine.py
-    │   └── test_cloudevents_envelope.py
+    │   ├── test_cloudevents_envelope.py
+    │   └── test_dlq_classifier.py     # Error class detection unit tests
     └── fixtures/
         ├── agent-alpha/
         │   ├── MEMORY.md
         │   └── engram-snapshot.json
         └── events/
             ├── memory_promoted.json
-            └── memory_reverted.json
+            ├── memory_reverted.json
+            └── dlq_entry.json         # Example KV_DLQ_MANIFEST entry fixture
 ```
 
 ### Key file notes
 
 - **`event-bus/nats-server.conf`** — primary NATS server config; defines JetStream storage directory, TLS certs, NKEYS resolver, and per-account subject ACLs. Start here when setting up a new deployment.
+- **`event-bus/streams/NOOSPHERE_DLQ.json`** — `deny_delete=true`, `deny_purge=true`, `max_age=168h`, `num_replicas=3`. This stream is immutable by default; operator break-glass removal requires 2-operator approval and audit log entry.
+- **`event-bus/kv-buckets/KV_DLQ_MANIFEST.sh`** — provisions the DLQ manifest KV bucket; used by the DLQ classifier, re-injection worker, alerting rules, and operator tooling.
 - **`event-bus/streams/*.json`** — one file per JetStream stream; defines subjects, retention policy, max age, replication factor, and storage backend. Applied via `nats stream add --config`.
-- **`workers/*/src/`** — each worker is a standalone process that creates a durable pull consumer on its stream, processes messages, acks on success, and publishes a downstream event. Workers are independently deployable and horizontally scalable.
-- **`control-plane/event-bus-bridge/`** — the GitLawb webhook bridge; listens for GitLawb repo events (PR merged, commit created) and publishes CloudEvents-wrapped NATS messages. This is the entry point for all L0 events into the NATS pipeline.
-- **`deploy/docker-compose.yml`** — full local dev stack: NATS, all control plane services, MCP server, all workers, Engram, MemPalace, Hindsight, and monitoring. Single `docker compose up` for a complete NoosphereOS instance.
-- **`deploy/leaf-node/`** — NATS Leaf Node configuration for edge data center / DePIN deployments; agents publish locally, the leaf connects to the sovereign central cluster for durable replication.
-- **`sdk/python/noosphere/events.py`** — NATS publish/subscribe helpers for Python workers and agents; wraps `nats.py` with CloudEvents serialization and subject-building utilities.
+- **`workers/dlq-reinjector/`** — the only component permitted to write messages back into source streams from the DLQ. Consumes `noosphere.dlq.reinject.>`, validates, re-publishes to origin subject, updates `KV_DLQ_MANIFEST`, and emits `noosphere.dlq.reinjected.{agent_did}` for audit.
+- **`workers/*/src/`** — each worker is a standalone process with a durable pull consumer, explicit ack after confirmed downstream write, idempotency check on CloudEvents `id`, and `msg.term()` on deterministic errors to skip retry budget.
+- **`control-plane/event-bus-bridge/`** — the GitLawb webhook bridge; entry point for all L0 events into the NATS pipeline.
+- **`deploy/docker-compose.yml`** — full local dev stack including the `dlq-reinjector` worker and all monitoring services.
+- **`deploy/leaf-node/`** — NATS Leaf Node configuration for edge/DePIN deployments.
+- **`sdk/python/noosphere/dlq.py`** — helpers for reading `KV_DLQ_MANIFEST`, triggering re-injection via `noosphere.dlq.reinject.*`, and querying DLQ depth by error class or memory class.
+- **`monitoring/grafana/dashboards/dlq-manifest.json`** — Grafana dashboard showing DLQ depth by error class, memory class, and age; critical panel for `sacred_fact` / `constitution` unresolved entries.
 
 ***
 
@@ -447,6 +635,7 @@ NoosphereOS/
 - You want to **share some knowledge globally**, with verifiable provenance, while keeping most memory local and private.
 - You need **horizontally scalable, event-driven propagation** across the full memory pipeline — Engram, MemPalace, Hindsight, archive, and DKG — without polling or tight coupling between services.
 - You operate **edge or distributed infrastructure** (e.g. DePIN, multi-site data centers) where a NATS Leaf Node topology lets each site publish locally while maintaining a sovereign central memory cluster.
+- You need a **guaranteed delivery guarantee for sacred facts**: the DLQ strategy ensures no memory promotion event expires silently — every failure is classified, tracked in `KV_DLQ_MANIFEST`, alerted on, and recoverable via the re-injection pipeline.
 
 ***
 

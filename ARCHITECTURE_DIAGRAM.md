@@ -9,10 +9,10 @@ This document contains the full set of architecture diagrams for the NoosphereOS
 1. [High-Level Architecture](#1-high-level-architecture)
 2. [Layer Definitions and Stack](#2-layer-definitions-and-stack)
 3. [Control Plane and Agent Runtime](#3-control-plane-and-agent-runtime)
-4. [L0: Hot Memory — GitLawb + MEMORY.md](#4-l0-hot-memory--gitlawb--memorymd)
+4. [L0: Hot Memory — Engram + GitLawb + MEMORY.md](#4-l0-hot-memory--engram--gitlawb--memorymd)
 5. [L0 Permission Model — UCAN + RBAC](#5-l0-permission-model--ucan--rbac)
 6. [L1: Local Memory OS — MemPalace](#6-l1-local-memory-os--mempalace)
-7. [L2: Distributed Memory Substrate — Supermemory](#7-l2-distributed-memory-substrate--supermemory)
+7. [L2: Distributed Memory Substrate — Hindsight](#7-l2-distributed-memory-substrate--hindsight)
 8. [L3: Immutable Archive — WeaveDB + Arweave/ArDrive](#8-l3-immutable-archive--weavedb--arweaveardrive)
 9. [L4: Verifiable Shared Knowledge — OriginTrail DKG](#9-l4-verifiable-shared-knowledge--origintrail-dkg)
 10. [Data Flow: Sacred Fact Promotion (L0 → L1 → L2 → L3)](#10-data-flow-sacred-fact-promotion-l0--l1--l2--l3)
@@ -60,7 +60,7 @@ This document contains the full set of architecture diagrams for the NoosphereOS
 │  AGENT RUNTIME(S) │   │  NOOSPHERE MEMORY MCP SERVER                  │
 │  OpenClaw         │   │  Exposes memory_get / propose / review / merge │
 │  moltbot          │──▶│  Enforces RBAC + UCAN per call                 │
-│  custom agents    │◀──│  Hides raw GitLawb / storage details           │
+│  custom agents    │◀──│  Hides raw GitLawb / Engram / storage details  │
 └───────────────────┘   └────────────────────────────────────────────────┘
          │                              │
          │                              │
@@ -68,9 +68,9 @@ This document contains the full set of architecture diagrams for the NoosphereOS
 ┌────────────────────────────────────────────────────────────────────────┐
 │                         MEMORY LAYERS                                  │
 │                                                                        │
-│  L0  MEMORY.md + GitLawb repos (hot memory, per agent)                │
+│  L0  Engram + MEMORY.md + GitLawb repos (hot memory, per agent)       │
 │  L1  MemPalace             (local episodic/semantic OS, per agent)     │
-│  L2  Supermemory           (distributed substrate, per tenant/org)     │
+│  L2  Hindsight             (distributed substrate, per tenant/org)     │
 │  L3  WeaveDB + Arweave     (immutable archive, per org)                │
 │  L4  OriginTrail DKG       (verifiable shared knowledge, selective)    │
 └────────────────────────────────────────────────────────────────────────┘
@@ -83,22 +83,22 @@ This document contains the full set of architecture diagrams for the NoosphereOS
 ```text
   GRANULARITY ◀────────────────────────────────────────────▶ BREADTH
 
-  L0 │ MEMORY.md + GitLawb │ per-agent │ hot, human-readable, signed history
+  L0 │ Engram + MEMORY.md + GitLawb │ per-agent │ hot, human-readable, signed history
      │
-  L1 │ MemPalace           │ per-agent/pod │ local episodic + semantic OS
+  L1 │ MemPalace                    │ per-agent/pod │ local episodic + semantic OS
      │
-  L2 │ Supermemory         │ per-tenant/cluster │ distributed, cross-agent recall
+  L2 │ Hindsight                    │ per-tenant/cluster │ sovereign distributed
+     │                               │                    │ retain/recall/reflect
+  L3 │ WeaveDB + Arweave            │ per-org/global │ immutable archive, artifact store
      │
-  L3 │ WeaveDB + Arweave   │ per-org/global │ immutable archive, artifact store
-     │
-  L4 │ OriginTrail DKG     │ shared/global │ verifiable, cross-org knowledge graph
+  L4 │ OriginTrail DKG              │ shared/global │ verifiable, cross-org knowledge graph
 
 
   SCOPE OF SHARING:
   ─────────────────────────────────────────────────────────────────
-  L0: Agent-local (shared only via explicit UCAN delegation)
+  L0: Agent-local (Engram store + GitLawb MEMORY.md; shared only via explicit UCAN delegation)
   L1: Agent-local (no remote sync by default)
-  L2: Tenant/org-wide (multi-agent access with policy)
+  L2: Tenant/org-wide (multi-agent access with policy; self-hosted PostgreSQL)
   L3: Immutable, org-level records (append-only, no deletion)
   L4: Selective public publication (explicit DKG export)
   ─────────────────────────────────────────────────────────────────
@@ -138,8 +138,8 @@ This document contains the full set of architecture diagrams for the NoosphereOS
 │                                                                          │
 │   ┌─────────────────────────────────────────────────────────────────┐   │
 │   │  MEMORY ROUTER                                                  │   │
-│   │  On read:  L0 (anchor) → L1 (local) → L2 (distributed)         │   │
-│   │  On write: stages to L1/L2, promotes to L0 via proposal         │   │
+│   │  On read:  L0 (anchor/MEMORY.md) → L1 (local) → L2 (Hindsight) │   │
+│   │  On write: stages to Engram/L1/L2, promotes to L0 via proposal  │   │
 │   │  On milestone: triggers L3 snapshot + optional L4 export        │   │
 │   └─────────────────────────────────────────────────────────────────┘   │
 │                                                                          │
@@ -157,39 +157,67 @@ This document contains the full set of architecture diagrams for the NoosphereOS
 
 ---
 
-## 4. L0: Hot Memory — GitLawb + MEMORY.md
+## 4. L0: Hot Memory — Engram + GitLawb + MEMORY.md
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────────┐
-│  L0 — PER-AGENT GitLawb REPO                                            │
-│  Repo DID: did:gitlawb:repo:agent-α-memory                              │
-│                                                                          │
-│  Branch: main (PROTECTED — no direct push except owner/operator)        │
-│  ├── MEMORY.md          ← canonical hot memory (sacred facts,           │
-│  │                         anchors, core preferences, constraints)       │
-│  └── /staging/          ← proposals, patches, drafts from agents        │
-│       └── <actor-did>/  ← per-proposer staging area                     │
+│  L0 — PER-AGENT HOT MEMORY                                              │
 │                                                                          │
 │  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │  MEMORY.md STRUCTURE (example)                                    │  │
+│  │  ENGRAM — Internal Per-Agent Memory Store                         │  │
 │  │                                                                   │  │
-│  │  # Agent α — Hot Memory                                           │  │
-│  │  last_updated: 2026-04-10T08:00:00Z                               │  │
-│  │  commit: C_main_abc123                                            │  │
+│  │  Storage: SQLite + FTS5 (full-text search)                        │  │
+│  │  Interfaces: MCP server | HTTP API | CLI | TUI                    │  │
 │  │                                                                   │  │
-│  │  ## Sacred Facts                                                  │  │
-│  │  - [fact-001] <content> (promoted by β, curated by γ)            │  │
-│  │  - [fact-002] <content> (promoted by agent, auto-curated)        │  │
+│  │  MCP Tools:                                                       │  │
+│  │    mem_save          ← agent writes a new memory                  │  │
+│  │    mem_search        ← semantic + keyword recall                  │  │
+│  │    mem_context       ← returns ranked memories for current task   │  │
+│  │    mem_session_summary ← end-of-session compression               │  │
 │  │                                                                   │  │
-│  │  ## Anchors                                                       │  │
-│  │  - Current task: ...                                              │  │
-│  │  - Core identity: ...                                             │  │
-│  │  - Risk constraints: ...                                          │  │
+│  │  Capabilities:                                                    │  │
+│  │    - Contradiction detection + resolution                         │  │
+│  │    - Context compaction recovery                                  │  │
+│  │    - Cross-session persistence (survives agent restarts)          │  │
+│  │    - Structured observation records with timestamps               │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                          │                                               │
+│                          │  Noosphere promotion pipeline                │
+│                          │  (curated subset only)                       │
+│                          ▼                                               │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  GitLawb REPO — did:gitlawb:repo:agent-α-memory                  │  │
+│  │                                                                   │  │
+│  │  Branch: main (PROTECTED — no direct push except owner/operator)  │  │
+│  │  ├── MEMORY.md          ← canonical exported hot memory           │  │
+│  │  │                         (sacred facts, anchors, core prefs)    │  │
+│  │  └── /staging/          ← proposals, patches, drafts              │  │
+│  │       └── <actor-did>/  ← per-proposer staging area               │  │
+│  │                                                                   │  │
+│  │  MEMORY.md STRUCTURE (example):                                   │  │
+│  │                                                                   │  │
+│  │    # Agent α — Hot Memory                                         │  │
+│  │    last_updated: 2026-04-10T08:00:00Z                             │  │
+│  │    commit: C_main_abc123                                          │  │
+│  │    engram_snapshot: engram://α/snapshot/xyz                       │  │
+│  │                                                                   │  │
+│  │    ## Sacred Facts                                                │  │
+│  │    - [fact-001] <content> (promoted by β, curated by γ)          │  │
+│  │    - [fact-002] <content> (promoted by agent, auto-curated)      │  │
+│  │                                                                   │  │
+│  │    ## Anchors                                                     │  │
+│  │    - Current task: ...                                            │  │
+│  │    - Core identity: ...                                           │  │
+│  │    - Risk constraints: ...                                        │  │
+│  │                                                                   │  │
+│  │  GitLawb Repo Events (subscribed by Noosphere Event Bus):         │  │
+│  │    - pr_opened, pr_reviewed, pr_merged, commit_created            │  │
+│  │    - Each event includes: author DID, UCAN CID, commit SHA        │  │
 │  └───────────────────────────────────────────────────────────────────┘  │
 │                                                                          │
-│  GitLawb Repo Events (subscribed by Noosphere Event Bus):               │
-│    - pr_opened, pr_reviewed, pr_merged, commit_created                  │
-│    - Each event includes: author DID, UCAN CID, commit SHA              │
+│  KEY PRINCIPLE: Engram is the primary store. MEMORY.md is a curated,   │
+│  human-legible export — never written directly by agents, only via      │
+│  the Noosphere proposal/review/merge pipeline.                          │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -209,12 +237,14 @@ This document contains the full set of architecture diagrams for the NoosphereOS
   │                     │ repo/pr/review                                │
   │                     │ repo/pr/merge                                 │
   │                     │ repo/event/subscribe                          │
+  │                     │ engram/write (own store)                      │
   ├─────────────────────┼───────────────────────────────────────────────┤
   │  peer_reader        │ repo/file/read (MEMORY.md only)               │
   │                     │ repo/event/subscribe                          │
   ├─────────────────────┼───────────────────────────────────────────────┤
   │  contributor agent  │ repo/file/read                                │
   │                     │ repo/file/propose (staging/* only)            │
+  │                     │ engram/write (own store, not target agent's)  │
   ├─────────────────────┼───────────────────────────────────────────────┤
   │  curator agent      │ repo/file/read                                │
   │                     │ repo/file/propose                             │
@@ -265,6 +295,7 @@ This document contains the full set of architecture diagrams for the NoosphereOS
 │   Triggers for reload/update:                                           │
 │   ├── Startup: loads MEMORY.md from GitLawb main branch                 │
 │   ├── On memory_promoted event: re-parses sacred facts, updates rooms   │
+│   ├── On Engram sync: incorporates latest observation records           │
 │   └── On task completion: writes new episodic entries locally           │
 │                                                                          │
 │   Recall interface:                                                      │
@@ -275,40 +306,55 @@ This document contains the full set of architecture diagrams for the NoosphereOS
 
 ---
 
-## 7. L2: Distributed Memory Substrate — Supermemory
+## 7. L2: Distributed Memory Substrate — Hindsight
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────────┐
-│  L2 — SUPERMEMORY CLUSTER (per tenant / org)                            │
+│  L2 — HINDSIGHT (sovereign self-hosted, per tenant / org)               │
 │                                                                          │
 │   ┌───────────────────────────────────────────────────────────────┐     │
-│   │  INGEST                                                       │     │
+│   │  INGEST (retain)                                              │     │
 │   │  - Subscribes to memory_promoted, task_completed, episodic    │     │
-│   │  - Builds structured observational memories:                  │     │
-│   │      {subject, type, content, source, provenance, timestamp}  │     │
+│   │  - Accepts structured memories from Engram sync workers       │     │
+│   │  - Extracts: facts, entities, relationships, temporal links   │     │
+│   │  - Builds structured observations:                            │     │
+│   │      {subject, type, content, entities, source,               │     │
+│   │       provenance, confidence, timestamp}                      │     │
 │   └───────────────────────────────────────────────────────────────┘     │
 │                          │                                               │
 │                          ▼                                               │
 │   ┌───────────────────────────────────────────────────────────────┐     │
-│   │  MEMORY STORE                                                 │     │
-│   │  - Distributed vector DB (semantic search)                    │     │
-│   │  - Relational / doc DB (structured memory, provenance)        │     │
-│   │  - Temporal index (time-aware recall and decay)               │     │
+│   │  MEMORY STORE (PostgreSQL-backed)                             │     │
+│   │  ├── Semantic index (vector embeddings)                       │     │
+│   │  ├── BM25 / keyword index (full-text)                         │     │
+│   │  ├── Entity + relationship graph (knowledge graph)            │     │
+│   │  └── Temporal index (time-aware recall, decay, ordering)      │     │
 │   └───────────────────────────────────────────────────────────────┘     │
 │                          │                                               │
 │                          ▼                                               │
 │   ┌───────────────────────────────────────────────────────────────┐     │
-│   │  RECALL API                                                   │     │
-│   │  - MCP server: memory tools for cross-agent queries           │     │
-│   │  - Scoped by: agent_id / user_id / tenant                     │     │
-│   │  - Returns: top-k memories + provenance + source commit CID   │     │
+│   │  RECALL + REFLECT API                                         │     │
+│   │  Retrieval strategies (fused, reranked):                      │     │
+│   │    - Semantic search (embedding similarity)                   │     │
+│   │    - Keyword/BM25 (exact and near-exact match)                │     │
+│   │    - Graph traversal (entity → relation → entity)             │     │
+│   │    - Temporal reasoning (before/after/during, recency decay)  │     │
+│   │  Reflect: synthesizes prior memories into updated summaries   │     │
+│   │  Scoped by: agent_id / user_id / tenant                       │     │
+│   │  Returns: top-k memories + provenance + source commit CID     │     │
+│   │  Interfaces: HTTP API | Python client | MCP wrapper           │     │
 │   └───────────────────────────────────────────────────────────────┘     │
 │                                                                          │
 │   Memory types handled:                                                  │
-│   ├── sacred_fact        (from MEMORY.md promotions)                    │
+│   ├── sacred_fact        (from MEMORY.md + Engram promotions)           │
 │   ├── episodic           (task logs, conversation summaries)             │
 │   ├── preference         (derived from interactions)                    │
 │   └── external_doc       (from ingested files / tools / searches)       │
+│                                                                          │
+│   Deployment:                                                            │
+│   ├── Self-hosted: Docker Compose or Kubernetes                         │
+│   ├── Embedded PostgreSQL or external cluster                           │
+│   └── No cloud dependency — fully sovereign                             │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -328,7 +374,8 @@ This document contains the full set of architecture diagrams for the NoosphereOS
 │  │    - Constitutions and policy documents                         │    │
 │  │    - PDFs, datasets, contracts, design docs                     │    │
 │  │  Tags on each asset:                                            │    │
-│  │    { agent_did, commit_sha, type, promoted_at }                 │    │
+│  │    { agent_did, commit_sha, engram_snapshot_id,                 │    │
+│  │      hindsight_obs_ids, type, promoted_at }                     │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                          │                                               │
 │                          │ arweave_tx_id                                 │
@@ -340,6 +387,8 @@ This document contains the full set of architecture diagrams for the NoosphereOS
 │  │      arweave_tx_id,                                             │    │
 │  │      agent_did,                                                 │    │
 │  │      commit_sha,                                                │    │
+│  │      engram_snapshot_id,                                        │    │
+│  │      hindsight_memory_ids: [...],                               │    │
 │  │      fact_ids: [...],                                           │    │
 │  │      type: "sacred_fact_snapshot" | "constitution" | ...,       │    │
 │  │      promoted_at,                                               │    │
@@ -363,15 +412,17 @@ This document contains the full set of architecture diagrams for the NoosphereOS
 │  L4 — ORIGINTRAIL DKG LAYER (opt-in, selective export)                  │
 │                                                                          │
 │  Input from L3: arweave_tx_id, WeaveDB record CID                       │
-│  Input from L2: Supermemory observation ID, provenance                  │
+│  Input from L2: Hindsight memory ID, observation provenance             │
+│  Input from L0: Engram snapshot ID, MEMORY.md commit SHA                │
 │                                                                          │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
 │  │  KNOWLEDGE ASSET (per exported fact or claim)                   │    │
 │  │  {                                                              │    │
 │  │    subject: agent_did / entity,                                 │    │
-│    │    claim: <semantic triple or JSON-LD statement>,              │    │
+│  │    claim: <semantic triple or JSON-LD statement>,               │    │
 │  │    provenance: {proposer, curator, promoted_at, commit},        │    │
-│  │    sources: [arweave_tx_id, supermemory_obs_id],                │    │
+│  │    sources: [arweave_tx_id, hindsight_memory_id,                │    │
+│  │              engram_snapshot_id],                               │    │
 │  │    access: public | org-permissioned | agent-group              │    │
 │  │  }                                                              │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
@@ -395,8 +446,8 @@ This document contains the full set of architecture diagrams for the NoosphereOS
   ─────────────────────────────────────────────────────────────────────────
 
   [Agent β Runtime]
-       │  1. Identifies candidate sacred fact
-       │     (e.g., long-lived constraint, identity anchor)
+       │  1. Identifies candidate sacred fact (e.g., long-lived constraint)
+       │     Writes candidate into β's own Engram store as an observation
        │
        ▼
   [Noosphere Memory MCP Server]
@@ -424,7 +475,8 @@ This document contains the full set of architecture diagrams for the NoosphereOS
        ▼
   [Curator Agent γ / Human Operator]
        │  5. Receives notification
-       │     Calls memory_diff(pr_id) → inspects change
+       │     Calls memory_diff(pr_id) → inspects change in context
+       │       of existing sacred facts and Engram state
        │
        │  6. Approves:
        │     Calls memory_review({ pr_id, decision: "approve" })
@@ -448,34 +500,56 @@ This document contains the full set of architecture diagrams for the NoosphereOS
        │                                                  │
        ▼  (parallel, async)                               ▼  (parallel, async)
 
-  [MemPalace — Agent α]                        [Supermemory Ingest Worker]
-       │  9a. Subscribes to memory_promoted         │  9b. Subscribes to memory_promoted
-       │      Fetches MEMORY.md at C_main           │      Reads MEMORY.md diff at C_main
-       │      Parses sacred facts section           │      Builds structured observation:
-       │      Updates palace:                       │        {subject: α,
-       │        - "Sacred Facts" room               │         type: sacred_fact,
-       │        - New triples inserted              │         content: X,
-       │        - High-priority recall flag set     │         source: gitlawb://α@C_main
-       │      Emits: local_memory_updated           │         provenance: {β, γ, ts}}
-       │                                            │      Writes to Supermemory API
-       │                                            │      Supermemory indexes fact
-       │                                            │      (semantic + temporal)
+  [Engram Sync Worker — Agent α]               [MemPalace — Agent α]
+       │  9a. Listens for memory_promoted            │  9b. Listens for memory_promoted
+       │      Fetches MEMORY.md at C_main            │      Fetches MEMORY.md at C_main
+       │      Writes structured sacred_fact          │      Parses sacred facts section
+       │      record into α's Engram store:          │      Updates palace:
+       │        {content, entities, provenance:      │        - "Sacred Facts" room
+       │         β-did, γ-did, commit, ts}           │        - New triples inserted
+       │      Resolves contradictions if any         │        - High-priority recall flag
+       │      Emits: engram_synced {fact_id}         │      Emits: local_memory_updated
+       │
+       ▼  (parallel, async)
+
+  [Hindsight Ingest Worker — L2]
+       │  9c. Listens for memory_promoted + engram_synced
+       │      Reads MEMORY.md diff at C_main + Engram record
+       │      Builds structured sacred_fact memory:
+       │        {subject: α,
+       │         type: sacred_fact,
+       │         content: X,
+       │         entities: [...],
+       │         relationships: [...],
+       │         source: gitlawb://α@C_main,
+       │         engram_id: <engram record ID>,
+       │         provenance: {proposer: β, curator: γ, ts}}
+       │      Calls Hindsight retain API (HTTP / Python client)
+       │      Hindsight indexes memory across:
+       │        - Semantic (vector) index
+       │        - BM25 keyword index
+       │        - Entity/relationship graph
+       │        - Temporal index
+       │      Fact now participates in retain/recall/reflect pipeline
+       │      Emits: hindsight_retained {memory_id}
        │
        ▼  (if sacred_fact policy = archive)
 
   [Archive Worker]
        │  10. Fetches MEMORY.md at C_main
        │      Writes to Arweave/ArDrive:
-       │        tags: {agent: α, commit: C_main, type: sacred_fact_snapshot}
+       │        tags: {agent: α, commit: C_main, type: sacred_fact_snapshot,
+       │               engram_snapshot_id, hindsight_memory_ids}
        │      Writes index row to WeaveDB:
-       │        {arweave_tx_id, agent: α, commit: C_main, fact_ids, ...}
+       │        {arweave_tx_id, agent: α, commit: C_main,
+       │         fact_ids, engram_snapshot_id, hindsight_memory_ids, ...}
        │      Emits: archive_snapshot_created {arweave_tx_id}
        │
        ▼  (only if dkg_export_requested)
 
   [DKG Exporter]
         11. Publishes Knowledge Asset on OriginTrail DKG
-            Links: arweave_tx_id + supermemory_obs_id
+            Links: arweave_tx_id + hindsight_memory_id + engram_snapshot_id
             Access: org-permissioned or public (per policy)
 ```
 
@@ -496,6 +570,26 @@ This document contains the full set of architecture diagrams for the NoosphereOS
   │  memory_merge    │  Merge approved PR to protected main branch      │
   │  memory_subscribe│  Subscribe to commit/PR events for an agent repo │
   └──────────────────┴──────────────────────────────────────────────────┘
+
+  INTEGRATION POINTS:
+
+  ├── MCP-based agents (OpenClaw, moltbot, custom) call Noosphere Memory
+  │   MCP tools instead of talking directly to Engram, GitLawb, or Hindsight.
+  │
+  ├── GitLawb: DID + UCAN-native repo/file/PR operations; canonical backend
+  │   for per-agent MEMORY.md governance and signed history.
+  │
+  ├── Engram: per-agent internal hot-memory engine (SQLite/FTS); accessed
+  │   by local runtimes or via its own MCP server; Noosphere exports
+  │   curated state periodically into MEMORY.md.
+  │
+  ├── MemPalace: local sidecar with MCP server for high-quality local
+  │   episodic/semantic recall; incorporates MEMORY.md anchors and
+  │   Engram sync records.
+  │
+  └── Hindsight: reachable via HTTP or Python client (MCP wrapper optional);
+      cluster-level L2 substrate for sovereign retain/recall/reflect
+      across agents and sessions.
 
   AUTHORIZATION CHAIN PER TOOL CALL:
 
@@ -546,33 +640,41 @@ This document contains the full set of architecture diagrams for the NoosphereOS
   SHARING MODES:
 
   Private (default)
-    Agent α's memory is readable only by owner + explicitly delegated peers.
-    No other agent can propose or read without a UCAN delegation.
+    Agent α's Engram store and MEMORY.md are accessible only to owner
+    and explicitly delegated peers. No agent can propose or read without
+    a UCAN delegation.
 
   Group-Shared
-    A group policy grants peer_reader or contributor rights to a set of agent DIDs.
-    Managed via RBAC group roles + batch UCAN issuance (e.g., "mining-agent-group").
+    A group policy grants peer_reader or contributor rights to a set of
+    agent DIDs. Managed via RBAC group roles + batch UCAN issuance
+    (e.g., "mining-agent-group").
 
   Org-Wide L2 Access
-    Supermemory (L2) may be queried by any agent in the tenant with appropriate
-    scope token — no per-agent repo delegation required for read.
+    Hindsight (L2) may be queried by any agent in the tenant with an
+    appropriate scope token — no per-agent repo delegation required for
+    read. Scoped by agent_id / tenant in the Hindsight recall API.
 
   Global / Verifiable (opt-in)
-    Only explicitly exported Knowledge Assets are visible on OriginTrail DKG.
-    No agent's full memory is ever automatically public.
+    Only explicitly exported Knowledge Assets are visible on OriginTrail
+    DKG. No agent's full Engram store or MEMORY.md is ever automatically
+    public.
 
   ROLLBACK POLICY:
   ─────────────────────────────────────────────────────────────────────
   1. Revert bad commit on MEMORY.md main branch (git revert C_bad)
   2. Emit memory_reverted { agent, reverted_commit, reason }
-  3. MemPalace re-fetches MEMORY.md → removes reverted facts from palace
-  4. Supermemory marks affected observations as "superseded"
-  5. WeaveDB row retains record for audit; Arweave snapshot is permanent
-     but can be annotated as superseded in WeaveDB index
+  3. Engram sync worker marks affected records as "superseded"
+  4. MemPalace re-fetches MEMORY.md → removes reverted facts from palace
+  5. Hindsight marks affected memories as "superseded" via update API
+  6. WeaveDB row retains record for audit; Arweave snapshot is permanent
+     but annotated as superseded in WeaveDB index
   ─────────────────────────────────────────────────────────────────────
 ```
 
 ---
 
 *Generated for the [NoosphereOS](https://github.com/enuno/NoosphereOS) project.*
-*Architecture ratified April 2026. Components: GitLawb (L0), MemPalace (L1), Supermemory (L2), WeaveDB + Arweave/ArDrive (L3), OriginTrail DKG (L4).*
+
+*Architecture ratified April 2026. Sovereign stack: **Engram + GitLawb MEMORY.md (L0)**, **MemPalace (L1)**, **Hindsight (L2)**, **WeaveDB + Arweave/ArDrive (L3)**, **OriginTrail DKG (L4)**.*
+
+*NoosphereOS is a fully sovereign multi-agent memory operating system combining web2 operational control (Engram, GitLawb, MemPalace, Hindsight) with web3 permanence and verifiable knowledge sharing (Arweave/ArDrive, WeaveDB, OriginTrail DKG).*

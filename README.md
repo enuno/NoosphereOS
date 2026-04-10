@@ -28,6 +28,46 @@ At its core, NoosphereOS treats **memory as moral architecture**: hot memory is 
 
 NoosphereOS defines five memory layers, each with a distinct scope, durability model, and sharing policy:
 
+```mermaid
+graph TB
+    subgraph Agent["🤖 Agent Boundary (per-agent sovereign)"]
+        L0["L0 · Hot Memory<br/>Engram (SQLite/FTS5) + GitLawb MEMORY.md<br/>─────────────────────────────<br/>• Sacred facts &amp; identity anchors<br/>• Human-legible, git-versioned<br/>• Proposal → Review → Merge pipeline<br/>• UCAN-gated cross-agent access<br/>Scope: per-agent · Durability: git-permanent"]
+
+        L1["L1 · Local Memory OS<br/>MemPalace<br/>─────────────────────────────<br/>• Episodic + semantic palace rooms<br/>• ChromaDB (vectors) + SQLite (triples)<br/>• Local-first, no remote sync by default<br/>• High-priority recall for sacred facts<br/>Scope: per-agent/pod · Durability: local-durable"]
+    end
+
+    subgraph Cluster["🏢 Cluster / Tenant Boundary"]
+        L2["L2 · Distributed Memory Substrate<br/>Hindsight (PostgreSQL)<br/>─────────────────────────────<br/>• Cross-session, cross-agent recall<br/>• 4 indexes: semantic · BM25 · graph · temporal<br/>• Retain → Recall → Reflect model<br/>• HTTP API + Python client + MCP wrapper<br/>Scope: tenant/cluster · Durability: sovereign DB"]
+    end
+
+    subgraph Permaweb["🌐 Immutable / Verifiable (org-level)"]
+        L3["L3 · Immutable Archive<br/>WeaveDB + Arweave / ArDrive<br/>─────────────────────────────<br/>• MEMORY.md milestones, constitutions, artifacts<br/>• Tagged: agent_did · commit_sha · engram_snapshot_id<br/>• WeaveDB for structured permaweb queries<br/>Scope: org-level · Durability: permanent"]
+
+        L4["L4 · Verifiable Shared Knowledge<br/>OriginTrail DKG<br/>─────────────────────────────<br/>• Knowledge Assets with full provenance<br/>• Links arweave_tx_id + hindsight_id + engram_id<br/>• Explicit opt-in export only — never automatic<br/>• Cross-org discovery + verifiable proofs<br/>Scope: global · Durability: DKG-permanent"]
+    end
+
+    subgraph Bus["⚡ NATS JetStream — Sovereign Event Bus"]
+        NATS["Streams: NOOSPHERE_MEMORY · L0–L4 · DLQ<br/>KV: AGENT_REGISTRY · UCAN_REVOCATIONS · SESSION_STATE · DLQ_MANIFEST<br/>CloudEvents envelopes · durable pull consumers · at-least-once delivery"]
+    end
+
+    L0 -->|"noosphere.memory.promoted.{agent_did}"| Bus
+    L0 -->|"noosphere.l0.engram.synced.{agent_did}"| Bus
+    Bus -->|"pull consumer"| L1
+    Bus -->|"pull consumer"| L2
+    Bus -->|"pull consumer (sacred_fact filter)"| L3
+    Bus -->|"pull consumer (explicit opt-in)"| L4
+    L1 -->|"noosphere.l1.mempalace.updated.{agent_did}"| Bus
+    L2 -->|"noosphere.l2.hindsight.retained.{agent_did}"| Bus
+    L3 -->|"noosphere.l3.archive.snapshot.created.{agent_did}"| Bus
+
+    style L0 fill:#1a2a1a,stroke:#4caf50,color:#e8f5e9
+    style L1 fill:#1a1a2a,stroke:#5c6bc0,color:#e8eaf6
+    style L2 fill:#2a1a1a,stroke:#ef5350,color:#ffebee
+    style L3 fill:#1a2a2a,stroke:#26c6da,color:#e0f7fa
+    style L4 fill:#2a2a1a,stroke:#ffa726,color:#fff3e0
+    style Bus fill:#0d0d0d,stroke:#78909c,color:#eceff1
+```
+
 ### L0 — Hot Memory (Engram + GitLawb `MEMORY.md`)
 
 - One GitLawb repo **per agent** (e.g. `did:gitlawb:repo:agent-α-memory`) is the canonical hot-memory repo.
@@ -353,6 +393,76 @@ The Noosphere control plane coordinates all memory operations and consists of fi
 ## Data Flow: Sacred Fact Promotion
 
 Example operation: **Agent β proposes a new sacred fact for Agent α**.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Beta as Agent β (Proposer)
+    actor Gamma as Agent γ (Curator)
+    participant CP as Control Plane<br/>(RBAC + UCAN Broker)
+    participant GL as GitLawb<br/>(MEMORY.md repo)
+    participant NATS as NATS JetStream<br/>NOOSPHERE_MEMORY stream
+    participant E as Engram Sync Worker<br/>(L0)
+    participant MP as MemPalace Worker<br/>(L1)
+    participant HS as Hindsight Ingest Worker<br/>(L2)
+    participant ARC as Archive Worker<br/>(L3)
+    participant DKG as DKG Exporter<br/>(L4)
+    participant DLQ as NOOSPHERE_DLQ<br/>+ KV_DLQ_MANIFEST
+
+    rect rgb(20, 40, 20)
+        Note over Beta,GL: Phase 1 — Proposal (L0 Governance)
+        Beta->>CP: memory_propose(fact, target=α)
+        CP->>CP: RBAC check (β has contributor rights for α)
+        CP->>CP: UCAN mint (repo/file/propose, staging, 10min TTL)
+        CP->>GL: create staging branch, patch MEMORY.md, open PR
+        GL-->>NATS: memory.proposal.created.{α-did}
+    end
+
+    rect rgb(20, 20, 40)
+        Note over Gamma,NATS: Phase 2 — Review and Merge (L0 Governance)
+        Gamma->>CP: memory_review → memory_merge (UCAN: repo/pr/merge)
+        CP->>GL: merge staging → main (commit C_main)
+        GL-->>NATS: memory.promoted.{α-did}<br/>{commit: C_main, fact_id, proposer: β, curator: γ}
+    end
+
+    rect rgb(40, 20, 20)
+        Note over NATS,HS: Phase 3 — Parallel Async Propagation (L0 / L1 / L2)
+        par Engram Sync
+            NATS-->>E: pull consumer · memory.promoted.{α-did}
+            E->>E: write sacred_fact record + resolve contradictions
+            E-->>NATS: l0.engram.synced.{α-did}
+        and MemPalace Update
+            NATS-->>MP: pull consumer · memory.promoted.{α-did}
+            MP->>MP: re-parse MEMORY.md@C_main, update palace room,<br/>insert triples, set high-priority recall flag
+            MP-->>NATS: l1.mempalace.updated.{α-did}
+        and Hindsight Ingest
+            NATS-->>HS: pull consumer · memory.promoted + engram.synced
+            HS->>HS: retain(content, entities, relationships,<br/>source, engram_id, provenance)
+            HS-->>NATS: l2.hindsight.retained.{α-did}
+        end
+    end
+
+    rect rgb(20, 35, 40)
+        Note over NATS,ARC: Phase 4 — Archival Snapshot (L3)
+        NATS-->>ARC: pull consumer · memory.promoted (sacred_fact filter)
+        ARC->>ARC: push MEMORY.md@C_main → Arweave/ArDrive<br/>write WeaveDB index row
+        ARC-->>NATS: l3.archive.snapshot.created.{α-did}
+    end
+
+    rect rgb(40, 35, 20)
+        Note over NATS,DKG: Phase 5 — DKG Export (L4, explicit opt-in)
+        NATS-->>DKG: pull consumer · l4.dkg.export_requested (opt-in only)
+        DKG->>DKG: publish Knowledge Asset<br/>(arweave_tx_id + hindsight_id + engram_id)
+    end
+
+    rect rgb(60, 20, 20)
+        Note over NATS,DLQ: Failure Path — Any Phase
+        NATS--xDLQ: MaxDeliver exhausted (5 attempts + backoff)<br/>→ route to noosphere.dlq.{stream}.{subject}
+        DLQ->>DLQ: classify error_class, write KV_DLQ_MANIFEST
+        DLQ-->>DLQ: sacred_fact / constitution → immediate PagerDuty alert<br/>deny_delete=true · deny_purge=true · 7-day retention · replicas=3
+        Note over DLQ: Fact preserved in all layers that succeeded.<br/>Pipeline incomplete until DLQ resolved via dlq-reinjector.
+    end
+```
 
 1. **Proposal (Engram + GitLawb staging)**
    - β writes the candidate fact into its own Engram store and calls `memory_propose` on the Noosphere Memory MCP server.
